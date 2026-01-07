@@ -550,6 +550,17 @@ class RasterLayer(RasterBase):
         :param str | None attr_name: The name of the attribute to use for the cell values.
             If None, a random name will be generated. Default is None.
         :param Callable | None rio_opener: A callable passed to Rasterio open() function.
+
+        .. note::
+            If your raster file is compressed with gzip (e.g., ending in .gz), you must prefix the file path with
+            ``/vsigzip/`` so that the underlying GDAL driver can read it. Example:
+
+            .. code-block:: python
+
+                # Relative path
+                layer = RasterLayer.from_file("/vsigzip/data/elevation.asc.gz")
+                # Absolute path
+                layer = RasterLayer.from_file("/vsigzip//home/user/data/elevation.asc.gz")
         """
 
         with rio.open(raster_file, "r", opener=rio_opener) as dataset:
