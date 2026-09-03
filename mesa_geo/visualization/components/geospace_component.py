@@ -245,11 +245,7 @@ def GeoSpaceLeaflet(
             controls.extend(model_view["controls"])
         kwargs["controls"] = controls
     elif model_view.get("controls"):
-        kwargs["controls"] = [
-            ipyleaflet.ZoomControl(),
-            ipyleaflet.AttributionControl(),
-            *model_view["controls"],
-        ]
+        kwargs["controls"] = list(model_view["controls"])
 
     ipyleaflet.Map.element(
         center=view,
@@ -274,13 +270,26 @@ class LeafletViz:
     popupProperties: dict[str, LeafletOption] | None = None  # noqa: N815
 
 
+class _ColormapWrapper:
+    """Wraps a Colormap so it can be passed directly and cached in lru_cache."""
+
+    def __init__(self, cmap: colors.Colormap, key: tuple):
+        self.cmap = cmap
+        self.key = key
+
+    def __hash__(self):
+        return hash(self.key)
+
+    def __eq__(self, other):
+        return isinstance(other, _ColormapWrapper) and self.key == other.key
+
+
 @functools.lru_cache(maxsize=128)
 def _build_colorbar_png(
-    cmap_spec: str | tuple | None,
-    color_spec: str | tuple | None,
+    cmap_wrapper: _ColormapWrapper,
+    colorbar_alpha: float | None,
     vmin: float,
     vmax: float,
-    alpha: float,
     label: str,
 ) -> str:
     """Build and cache a standalone colorbar PNG data URL.
@@ -289,20 +298,7 @@ def _build_colorbar_png(
     steps do not re-render identical figures.
     """
     norm = colors.Normalize(vmin=vmin, vmax=vmax)
-    if cmap_spec is not None:
-        if isinstance(cmap_spec, str):
-            cmap = colormaps[cmap_spec]
-        else:
-            cmap = colors.LinearSegmentedColormap.from_list(label, list(cmap_spec))
-        colorbar_alpha = alpha
-    else:
-        rgba = colors.to_rgba(color_spec)
-        cmap = colors.LinearSegmentedColormap.from_list(
-            label, [(0, 0, 0, 0), (*rgba[:3], alpha)]
-        )
-        colorbar_alpha = None
-
-    sm = ScalarMappable(norm=norm, cmap=cmap)
+    sm = ScalarMappable(norm=norm, cmap=cmap_wrapper.cmap)
     # Use Figure directly (never pyplot) to avoid memory leaks across render cycles
     fig = Figure(figsize=(2.5, 0.4), dpi=100)
     ax = fig.add_subplot(111)
@@ -388,8 +384,10 @@ class _RasterRenderer:
             if style is None:
                 continue
 
-            # Read _data directly; get_band() would copy the whole array.
-            data = layer._data[band_name]
+            # get_band() is the live read: it reconstructs the array from
+            # cells so runtime mutations in model.step() are reflected.
+            # (_data is only a construction-time snapshot until PR #332 lands).
+            data = layer.get_band(band_name)
             rgba = self._band_rgba(data, style)
             if rgba is None:
                 continue
@@ -428,28 +426,45 @@ class _RasterRenderer:
         if style.colormap:
             cmap = style.colormap
             if isinstance(cmap, str):
-                cmap_spec = cmap
-            elif isinstance(cmap, colors.Colormap):
-                cmap_spec = cmap.name
+                cmap_obj = colormaps[cmap]
+                key = ("named", cmap)
             elif isinstance(cmap, list):
-                cmap_spec = tuple(cmap)
+                # Recursively convert any nested lists/tuples (RGB sequences) so key is hashable
+                key = (
+                    "list",
+                    tuple(
+                        tuple(c) if isinstance(c, (list, tuple)) else c
+                        for c in cmap
+                    ),
+                )
+                cmap_obj = colors.LinearSegmentedColormap.from_list(label, cmap)
+            elif isinstance(cmap, colors.Colormap):
+                sample_bytes = cmap(np.linspace(0, 1, 256)).tobytes()
+                key = ("lut", getattr(cmap, "colorbar_extend", None), sample_bytes)
+                cmap_obj = cmap
             else:
-                cmap_spec = str(cmap)
-            color_spec = None
+                key = ("str", str(cmap))
+                cmap_obj = colormaps[str(cmap)]
+            colorbar_alpha = alpha
         else:
-            cmap_spec = None
-            color_spec = (
+            rgba = colors.to_rgba(style.color)
+            color_key = (
                 tuple(style.color)
                 if isinstance(style.color, (list, tuple))
                 else str(style.color)
             )
+            key = ("color", color_key, alpha)
+            cmap_obj = colors.LinearSegmentedColormap.from_list(
+                label, [(0, 0, 0, 0), (*rgba[:3], alpha)]
+            )
+            colorbar_alpha = None
 
+        wrapper = _ColormapWrapper(cmap_obj, key)
         return _build_colorbar_png(
-            cmap_spec,
-            color_spec,
+            wrapper,
+            colorbar_alpha,
             float(vmin),
             float(vmax),
-            alpha,
             label,
         )
 
@@ -494,6 +509,8 @@ class _RasterRenderer:
             cmap = style.colormap
             if isinstance(cmap, str):
                 cmap = colormaps[cmap]
+            elif isinstance(cmap, list):
+                cmap = colors.LinearSegmentedColormap.from_list("custom_cmap", cmap)
             rgba = cmap(norm(data))
             rgba[..., 3] *= style.alpha
         else:
@@ -533,11 +550,16 @@ class _VectorRenderer:
 
         If value is None or cannot be parsed by matplotlib (e.g. CSS-only keywords
         like 'transparent'), return the original value.
+        Preserves alpha (8-digit hex) when transparency is encoded.
         """
         if value is None:
             return None
         try:
-            return colors.to_hex(colors.to_rgba(value))
+            rgba = colors.to_rgba(value)
+            has_alpha = rgba[3] < 1.0 or (
+                isinstance(value, str) and len(value) == 9 and value.startswith("#")
+            )
+            return colors.to_hex(rgba, keep_alpha=has_alpha)
         except (ValueError, TypeError):
             return value
 
@@ -568,6 +590,7 @@ class _VectorRenderer:
         ipyleaflet marker element
 
         """
+        properties = dict(properties)
         for key in ("color", "fillColor", "fill_color"):
             if key in properties:
                 properties[key] = self._css_color(properties[key])
@@ -612,7 +635,7 @@ class _VectorRenderer:
             transformed_geometry = agent.get_transformed_geometry(transformer)
 
             if self.agent_portrayal:
-                properties = self.agent_portrayal(agent)
+                properties = dict(self.agent_portrayal(agent))
                 agent_portrayal = LeafletViz(
                     popupProperties=properties.pop("description", None)
                 )
