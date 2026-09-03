@@ -10,6 +10,7 @@ import warnings
 from io import BytesIO
 
 import geopandas as gpd
+import ipyleaflet
 import matplotlib
 import matplotlib.colors
 import mesa
@@ -26,13 +27,6 @@ from mesa_geo.raster_layers import RasterLayer
 from mesa_geo.visualization.components.geospace_component import MapModule
 
 # ---- Helpers ----
-
-
-@pytest.fixture(autouse=True)
-def _reset_colorbar_state():
-    """Reset module-level colorbar warning state before each test."""
-    gc._COLORBAR_STATE["warned"] = False
-    yield
 
 
 def _make_model_with_raster(data, *, crs="epsg:4326", band_name="band0"):
@@ -353,35 +347,140 @@ class TestConstantBandRendered:
         assert np.all(decoded[..., 3] == 255)
 
 
-class TestColorbarWarnsOnce:
-    """colorbar=True warns once per render, not once per band."""
+class TestColorbarRendering:
+    """colorbar=True renders standalone colorbars delivered as WidgetControl."""
 
-    def test_warns_once(self):
-        data1 = np.array([[10, 20], [30, 40]], dtype=float)
-        data2 = np.array([[50, 60], [70, 80]], dtype=float)
-        model, layer = _make_model_with_raster(data1, band_name="a")
-        layer.set_band("b", data2)
-
+    def test_colorbar_rendered_for_colormap(self):
+        data = np.array([[10, 20], [30, 40]], dtype=float)
+        model, _ = _make_model_with_raster(data, band_name="elevation")
         style = PropertyLayerStyle(colormap="viridis", vmin=0, vmax=100, colorbar=True)
 
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            _render_rasters(model, style)
-            colorbar_warnings = [x for x in w if "colorbar" in str(x.message).lower()]
-            assert len(colorbar_warnings) == 1
+        mm = MapModule(
+            portrayal_method=lambda _: {},
+            tiles=xyz.OpenStreetMap.Mapnik,
+            raster_portrayal=style,
+        )
+        out = mm.render(model)
 
-    def test_warns_once_across_multiple_mapmodule_instances(self):
+        cb_url = out["layers"]["rasters"][0]["colorbar"]
+        assert cb_url is not None
+        assert cb_url.startswith("data:image/png;base64,")
+
+        # WidgetControl delivery
+        assert len(out["controls"]) == 1
+        ctrl = out["controls"][0]
+        assert isinstance(ctrl, ipyleaflet.WidgetControl)
+        assert ctrl.position == "bottomright"
+        assert cb_url in ctrl.widget.value
+
+    def test_colorbar_disabled(self):
         data = np.array([[10, 20], [30, 40]], dtype=float)
-        model, _ = _make_model_with_raster(data, band_name="a")
+        model, _ = _make_model_with_raster(data, band_name="elevation")
+        style = PropertyLayerStyle(colormap="viridis", colorbar=False)
+
+        mm = MapModule(
+            portrayal_method=lambda _: {},
+            tiles=xyz.OpenStreetMap.Mapnik,
+            raster_portrayal=style,
+        )
+        out = mm.render(model)
+
+        assert "colorbar" not in out["layers"]["rasters"][0]
+        assert len(out["controls"]) == 0
+
+    def test_multiple_bands_stacked_in_single_widget_control(self):
+        data1 = np.array([[10, 20], [30, 40]], dtype=float)
+        data2 = np.array([[50, 60], [70, 80]], dtype=float)
+        model, layer = _make_model_with_raster(data1, band_name="elevation")
+        layer.set_band("slope", data2)
+
+        def portrayal(layer_name, band_name):
+            if band_name == "elevation":
+                return PropertyLayerStyle(colormap="viridis", colorbar=True)
+            return PropertyLayerStyle(colormap="plasma", colorbar=True)
+
+        mm = MapModule(
+            portrayal_method=lambda _: {},
+            tiles=xyz.OpenStreetMap.Mapnik,
+            raster_portrayal=portrayal,
+        )
+        out = mm.render(model)
+
+        assert len(out["layers"]["rasters"]) == 2
+        cb1 = out["layers"]["rasters"][0]["colorbar"]
+        cb2 = out["layers"]["rasters"][1]["colorbar"]
+        assert cb1 is not None
+        assert cb2 is not None
+
+        # Exactly ONE WidgetControl containing both stacked images
+        assert len(out["controls"]) == 1
+        html = out["controls"][0].widget.value
+        assert cb1 in html
+        assert cb2 in html
+
+    def test_colorbar_labels(self):
+        data = np.array([[10, 20], [30, 40]], dtype=float)
+        style = PropertyLayerStyle(colormap="viridis", colorbar=True)
+
+        # 1. With layer name
+        cb_named = gc._RasterRenderer._render_colorbar("grid", "elevation", data, style)
+        assert cb_named is not None
+        assert cb_named.startswith("data:image/png;base64,")
+
+        # 2. Without layer name
+        cb_unnamed = gc._RasterRenderer._render_colorbar(None, "elevation", data, style)
+        assert cb_unnamed is not None
+        assert cb_unnamed.startswith("data:image/png;base64,")
+
+    def test_uniform_color_colorbar_rendered(self):
+        data = np.array([[10, 20], [30, 40]], dtype=float)
+        model, _ = _make_model_with_raster(data, band_name="elevation")
+        style = PropertyLayerStyle(color="red", vmin=0, vmax=100, colorbar=True)
+
+        mm = MapModule(
+            portrayal_method=lambda _: {},
+            tiles=xyz.OpenStreetMap.Mapnik,
+            raster_portrayal=style,
+        )
+        out = mm.render(model)
+
+        cb_url = out["layers"]["rasters"][0]["colorbar"]
+        assert cb_url is not None
+        assert cb_url.startswith("data:image/png;base64,")
+        assert len(out["controls"]) == 1
+
+    def test_no_colorbar_warning_emitted(self):
+        data = np.array([[10, 20], [30, 40]], dtype=float)
+        model, _ = _make_model_with_raster(data, band_name="elevation")
         style = PropertyLayerStyle(colormap="viridis", colorbar=True)
 
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            # Simulating two render cycles (GeoSpaceLeaflet creates a new MapModule each time)
-            _render_rasters(model, style)
             _render_rasters(model, style)
             colorbar_warnings = [x for x in w if "colorbar" in str(x.message).lower()]
-            assert len(colorbar_warnings) == 1
+            assert len(colorbar_warnings) == 0
+
+    def test_colorbar_rendering_cached(self):
+        data = np.array([[10, 20], [30, 40]], dtype=float)
+        model, _ = _make_model_with_raster(data, band_name="elevation")
+        style = PropertyLayerStyle(colormap="viridis", vmin=0, vmax=100, colorbar=True)
+
+        mm = MapModule(
+            portrayal_method=lambda _: {},
+            tiles=xyz.OpenStreetMap.Mapnik,
+            raster_portrayal=style,
+        )
+        gc._build_colorbar_png.cache_clear()
+        out1 = mm.render(model)
+        assert gc._build_colorbar_png.cache_info().misses == 1
+        assert gc._build_colorbar_png.cache_info().hits == 0
+
+        out2 = mm.render(model)
+        assert gc._build_colorbar_png.cache_info().hits == 1
+        assert (
+            out1["layers"]["rasters"][0]["colorbar"]
+            == out2["layers"]["rasters"][0]["colorbar"]
+        )
 
 
 class TestPortrayalValidation:
@@ -500,6 +599,8 @@ class TestRenderByteIdentitySnapshot:
         )
         np.testing.assert_array_equal(decoded, expected_rgba)
         assert out["layers"]["rasters"][0]["bounds"] == [[0.0, 0.0], [2.0, 2.0]]
+        assert "colorbar" not in out["layers"]["rasters"][0]
+        assert len(out["controls"]) == 0
         assert out["layers"]["total_bounds"] == [[0.0, 0.0], [2.0, 2.0]]
         assert len(out["layers"]["vectors"]) == 1
         assert len(out["agents"][0]["features"]) == 1
@@ -538,6 +639,8 @@ class TestRenderByteIdentitySnapshot:
         expected_rgba[..., 3] = int(0.8 * 255)  # default alpha is 0.8
         np.testing.assert_array_equal(decoded, expected_rgba)
         assert out["layers"]["rasters"][0]["bounds"] == [[0.0, 0.0], [2.0, 2.0]]
+        assert out["layers"]["rasters"][0]["colorbar"] is not None
+        assert len(out["controls"]) == 1
         assert out["layers"]["total_bounds"] == [[0.0, 0.0], [2.0, 2.0]]
         assert len(out["layers"]["vectors"]) == 1
         assert len(out["agents"][0]["features"]) == 1

@@ -1,22 +1,26 @@
+import base64
 import dataclasses
+import functools
 import warnings
 from dataclasses import dataclass
+from io import BytesIO
 
 import geopandas as gpd
 import ipyleaflet
+import ipywidgets
 import numpy as np
 import solara
 import xyzservices
 from folium.utilities import image_to_url
 from matplotlib import colormaps, colors
+from matplotlib.cm import ScalarMappable
+from matplotlib.figure import Figure
 from mesa.visualization.components import PropertyLayerStyle
 from mesa.visualization.utils import update_counter
 from shapely.geometry import Point, mapping
 
 from mesa_geo.raster_layers import ImageLayer, RasterBase, RasterLayer
 from mesa_geo.tile_layers import LeafletOption, RasterWebTile
-
-_COLORBAR_STATE = {"warned": False}
 
 
 def make_geospace_leaflet(
@@ -95,6 +99,7 @@ def make_geospace_component(
             import xyzservices.providers as xyz
 
             xyz.MapBox(id="<insert map_ID here>", accessToken="my-private-ACCESS_TOKEN")
+
 
     :param **kwargs: Extra keyword arguments forwarded to :class:`ipyleaflet.Map`
         (e.g., ``zoom=``, ``scroll_wheel_zoom=``). The available options can be found
@@ -184,6 +189,19 @@ def GeoSpaceLeaflet(
         )
     for layer in model_view["layers"]["vectors"]:
         layers.append(ipyleaflet.GeoJSON(element=layer))
+
+    if "controls" in kwargs:
+        controls = list(kwargs.pop("controls"))
+        if model_view.get("controls"):
+            controls.extend(model_view["controls"])
+        kwargs["controls"] = controls
+    elif model_view.get("controls"):
+        kwargs["controls"] = [
+            ipyleaflet.ZoomControl(),
+            ipyleaflet.AttributionControl(),
+            *model_view["controls"],
+        ]
+
     ipyleaflet.Map.element(
         center=view,
         layers=[
@@ -205,6 +223,53 @@ class LeafletViz:
 
     style: dict[str, LeafletOption] | None = None
     popupProperties: dict[str, LeafletOption] | None = None  # noqa: N815
+
+
+@functools.lru_cache(maxsize=128)
+def _build_colorbar_png(
+    cmap_spec: str | tuple | None,
+    color_spec: str | tuple | None,
+    vmin: float,
+    vmax: float,
+    alpha: float,
+    label: str,
+) -> str:
+    """Build and cache a standalone colorbar PNG data URL.
+
+    Pure function of styling parameters so repeated render cycles in simulation
+    steps do not re-render identical figures.
+    """
+    norm = colors.Normalize(vmin=vmin, vmax=vmax)
+    if cmap_spec is not None:
+        if isinstance(cmap_spec, str):
+            cmap = colormaps[cmap_spec]
+        else:
+            cmap = colors.LinearSegmentedColormap.from_list(label, list(cmap_spec))
+        colorbar_alpha = alpha
+    else:
+        rgba = colors.to_rgba(color_spec)
+        cmap = colors.LinearSegmentedColormap.from_list(
+            label, [(0, 0, 0, 0), (*rgba[:3], alpha)]
+        )
+        colorbar_alpha = None
+
+    sm = ScalarMappable(norm=norm, cmap=cmap)
+    # Use Figure directly (never pyplot) to avoid memory leaks across render cycles
+    fig = Figure(figsize=(2.5, 0.4), dpi=100)
+    ax = fig.add_subplot(111)
+    cb = fig.colorbar(
+        sm,
+        cax=ax,
+        orientation="horizontal",
+        alpha=colorbar_alpha,
+    )
+    cb.set_label(label, fontsize=8)
+    cb.ax.tick_params(labelsize=7)
+
+    buf = BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", transparent=True)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
 
 
 class _RasterRenderer:
@@ -274,17 +339,9 @@ class _RasterRenderer:
             if style is None:
                 continue
 
-            if getattr(style, "colorbar", False) and not _COLORBAR_STATE["warned"]:
-                warnings.warn(
-                    "PropertyLayerStyle.colorbar is not supported by the Leaflet "
-                    "renderer and is ignored.",
-                    UserWarning,
-                    stacklevel=2,
-                )
-                _COLORBAR_STATE["warned"] = True
-
             # Read _data directly; get_band() would copy the whole array.
-            rgba = self._band_rgba(layer._data[band_name], style)
+            data = layer._data[band_name]
+            rgba = self._band_rgba(data, style)
             if rgba is None:
                 continue
 
@@ -294,13 +351,81 @@ class _RasterRenderer:
                 total_bounds=layer.total_bounds,
             ).to_crs(self._crs)
             values = layer_to_render.values.transpose([1, 2, 0])
-            overlays.append(
-                {
-                    "url": image_to_url((np.clip(values, 0, 1) * 255).astype(np.uint8)),
-                    "bounds": self._bounds(layer_to_render),
-                }
-            )
+
+            colorbar_url = None
+            if getattr(style, "colorbar", False):
+                colorbar_url = self._render_colorbar(layer_name, band_name, data, style)
+
+            overlay = {
+                "url": image_to_url((np.clip(values, 0, 1) * 255).astype(np.uint8)),
+                "bounds": self._bounds(layer_to_render),
+            }
+            if colorbar_url is not None:
+                overlay["colorbar"] = colorbar_url
+            overlays.append(overlay)
         return overlays
+
+    @staticmethod
+    def _render_colorbar(layer_name, band_name, data, style):
+        """Render a standalone colorbar to a base64 PNG data URL."""
+        vmin = style.vmin if style.vmin is not None else np.nanmin(data)
+        vmax = style.vmax if style.vmax is not None else np.nanmax(data)
+        if not np.isfinite(vmin) or not np.isfinite(vmax):
+            return None
+
+        label = f"{layer_name}: {band_name}" if layer_name else str(band_name)
+        alpha = float(style.alpha) if style.alpha is not None else 0.8
+
+        if style.colormap:
+            cmap = style.colormap
+            if isinstance(cmap, str):
+                cmap_spec = cmap
+            elif isinstance(cmap, colors.Colormap):
+                cmap_spec = cmap.name
+            elif isinstance(cmap, list):
+                cmap_spec = tuple(cmap)
+            else:
+                cmap_spec = str(cmap)
+            color_spec = None
+        else:
+            cmap_spec = None
+            color_spec = (
+                tuple(style.color)
+                if isinstance(style.color, (list, tuple))
+                else str(style.color)
+            )
+
+        return _build_colorbar_png(
+            cmap_spec,
+            color_spec,
+            float(vmin),
+            float(vmax),
+            alpha,
+            label,
+        )
+
+    @staticmethod
+    def _create_colorbar_control(colorbar_urls):
+        """Create a single ipyleaflet WidgetControl containing stacked colorbars."""
+        if not colorbar_urls:
+            return None
+
+        imgs_html = "".join(
+            f'<div style="margin: 2px 0;"><img src="{url}" style="display: block; max-width: 100%; height: auto;" /></div>'
+            for url in colorbar_urls
+        )
+        container_html = (
+            f'<div class="leaflet-colorbar-control" style="'
+            f"background: rgba(255, 255, 255, 0.85); "
+            f"padding: 4px 8px; "
+            f"border-radius: 4px; "
+            f"box-shadow: 0 1px 5px rgba(0,0,0,0.4); "
+            f'pointer-events: auto;">'
+            f"{imgs_html}"
+            f"</div>"
+        )
+        widget = ipywidgets.HTML(value=container_html)
+        return ipyleaflet.WidgetControl(widget=widget, position="bottomright")
 
     @staticmethod
     def _band_rgba(data, style):
@@ -547,9 +672,21 @@ class MapModule:
         self.tiles = tiles
 
     def render(self, model):
+        layers = self._render_layers(model)
+        agents = self._render_agents(model)
+        controls = []
+        colorbar_urls = [
+            overlay["colorbar"]
+            for overlay in layers["rasters"]
+            if overlay.get("colorbar")
+        ]
+        colorbar_control = _RasterRenderer._create_colorbar_control(colorbar_urls)
+        if colorbar_control is not None:
+            controls.append(colorbar_control)
         return {
-            "layers": self._render_layers(model),
-            "agents": self._render_agents(model),
+            "layers": layers,
+            "agents": agents,
+            "controls": controls,
         }
 
     def _render_layers(self, model):
