@@ -1,37 +1,40 @@
 import unittest
 
-import xyzservices.providers as xyz
+import xyzservices
 
 import mesa_geo as mg
 
 
 class TestRasterWebTile(unittest.TestCase):
     def test_from_xyzservices(self):
-        map_tile = mg.RasterWebTile.from_xyzservices(xyz.CartoDB.Positron)
-
-        self.assertEqual(map_tile.url, xyz.CartoDB.Positron.url)
-        self.assertEqual(
-            map_tile.options,
-            {
-                "attribution": '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
-                "subdomains": "abcd",
-                "max_zoom": 20,
-                "variant": "light_all",
-                "name": "CartoDB.Positron",
-            },
+        provider = xyzservices.TileProvider(
+            name="Test.Provider",
+            url="https://{s}.tiles.example.com/{variant}/{z}/{x}/{y}.png",
+            attribution="(C) Example contributors",
+            html_attribution='&copy; <a href="https://example.com">Example</a> contributors',
+            subdomains="abcd",
+            max_zoom=20,
+            variant="light_all",
         )
+        map_tile = mg.RasterWebTile.from_xyzservices(provider)
+
+        expected_options = {
+            "attribution": '&copy; <a href="https://example.com">Example</a> contributors',
+            "subdomains": "abcd",
+            "max_zoom": 20,
+            "variant": "light_all",
+            "name": "Test.Provider",
+        }
+        self.assertEqual(
+            map_tile.url, "https://{s}.tiles.example.com/{variant}/{z}/{x}/{y}.png"
+        )
+        self.assertEqual(map_tile.options, expected_options)
         self.assertEqual(map_tile.kind, "raster_web_tile")
         self.assertEqual(
             map_tile.to_dict(),
             {
-                "url": xyz.CartoDB.Positron.url,
-                "options": {
-                    "attribution": '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
-                    "subdomains": "abcd",
-                    "max_zoom": 20,
-                    "variant": "light_all",
-                    "name": "CartoDB.Positron",
-                },
+                "url": "https://{s}.tiles.example.com/{variant}/{z}/{x}/{y}.png",
+                "options": expected_options,
                 "kind": "raster_web_tile",
             },
         )
