@@ -49,7 +49,8 @@ dependencies = [
   "pyproj",
   "folium",
   "xyzservices>=2022.9.0",
-  "ipyleaflet"
+  "ipyleaflet",
+  "ipyvuetify<3; python_version < '3.12'"
 ]
 dynamic = ["version"]
 
