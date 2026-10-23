@@ -5,9 +5,19 @@ import warnings
 import geopandas as gpd
 import mesa
 import numpy as np
-from shapely.geometry import Point, Polygon
+import pyproj
+import shapely
+from shapely.geometry import (
+    GeometryCollection,
+    LineString,
+    MultiLineString,
+    MultiPoint,
+    Point,
+    Polygon,
+)
 
 import mesa_geo as mg
+from mesa_geo.geoagent import _transform
 
 
 class TestGeoSpace(unittest.TestCase):
@@ -307,3 +317,55 @@ class TestGeoSpace(unittest.TestCase):
         self.assertEqual(space.crs.to_epsg(), 3857)
         self.assertEqual(space.agents[0].crs.to_epsg(), 3857)
         self.assertEqual(space.transformer.source_crs.to_epsg(), space.crs.to_epsg())
+
+    def test_transform_point_agent_without_warnings(self):
+        agent = mg.GeoAgent(model=self.model, geometry=Point(1, 2), crs="epsg:4326")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            new_agent = agent.to_crs("epsg:3857")
+            feature = agent.__geo_interface__()
+
+        self.assertAlmostEqual(new_agent.geometry.x, 111319.49079327357)
+        self.assertAlmostEqual(new_agent.geometry.y, 222684.20850554403)
+        self.assertAlmostEqual(feature["geometry"]["coordinates"][0], 1.0)
+        self.assertAlmostEqual(feature["geometry"]["coordinates"][1], 2.0)
+
+    def test_transform_passes_lists_to_the_transformer(self):
+        class ListOnlyTransformer:
+            def transform(self, *args):
+                if any(isinstance(arg, np.ndarray) for arg in args):
+                    raise TypeError("transform received a NumPy array")
+                return args
+
+        for geometry in [
+            Point(1, 2),
+            Point(1, 2, 3),
+            Polygon([(0, 0), (0, 2), (2, 2), (2, 0)]),
+            GeometryCollection([Point(1, 2), LineString([(0, 0), (1, 1)])]),
+        ]:
+            with self.subTest(geometry=geometry.wkt):
+                result = _transform(ListOnlyTransformer(), geometry)
+                self.assertEqual(result.wkt, geometry.wkt)
+
+    def test_transform_mixed_dimension_collections(self):
+        transformer = pyproj.Transformer.from_crs(
+            "epsg:4326", "epsg:3857", always_xy=True
+        )
+        for collection in [
+            GeometryCollection([Point(1, 2, 5), LineString([(1, 2), (3, 4)])]),
+            MultiPoint([(1, 2, 5), (3, 4)]),
+            MultiLineString(
+                [LineString([(1, 2, 5), (3, 4, 5)]), LineString([(1, 2), (3, 4)])]
+            ),
+        ]:
+            with self.subTest(collection=collection.wkt):
+                self.assertEqual([p.has_z for p in collection.geoms], [True, False])
+                result = _transform(transformer, collection)
+                self.assertEqual(result.geom_type, collection.geom_type)
+                for part, original in zip(result.geoms, collection.geoms):
+                    self.assertEqual(part.has_z, original.has_z)
+                    coords = shapely.get_coordinates(original, include_z=original.has_z)
+                    np.testing.assert_allclose(
+                        shapely.get_coordinates(part, include_z=part.has_z),
+                        np.column_stack(transformer.transform(*coords.T.tolist())),
+                    )

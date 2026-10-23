@@ -11,12 +11,25 @@ import json
 import geopandas as gpd
 import numpy as np
 import pyproj
+import shapely
 from mesa import Agent, Model
 from shapely.geometry import mapping
-from shapely.geometry.base import BaseGeometry
-from shapely.ops import transform
+from shapely.geometry.base import BaseGeometry, BaseMultipartGeometry
 
 from mesa_geo.geo_base import GeoBase
+
+
+def _transform(transformer, geometry):
+    if isinstance(geometry, BaseMultipartGeometry):
+        return type(geometry)(
+            [_transform(transformer, part) for part in geometry.geoms]
+        )
+    # Lists, not arrays: pyproj < 3.8 warns on 1-element arrays under NumPy 1.25 to 2.3.
+    return shapely.transform(
+        geometry,
+        lambda coords: np.column_stack(transformer.transform(*coords.T.tolist())),
+        include_z=geometry.has_z,
+    )
 
 
 class GeoAgent(Agent, GeoBase):
@@ -65,7 +78,7 @@ class GeoAgent(Agent, GeoBase):
         Return the transformed geometry given a transformer.
         """
 
-        return transform(transformer.transform, self.geometry)
+        return _transform(transformer, self.geometry)
 
     def step(self):
         """
@@ -80,7 +93,7 @@ class GeoAgent(Agent, GeoBase):
         properties = dict(vars(self))
         properties["model"] = str(self.model)
         geometry = properties.pop("geometry")
-        geometry = transform(self.model.space.transformer.transform, geometry)
+        geometry = _transform(self.model.space.transformer, geometry)
 
         return {
             "type": "Feature",
